@@ -312,7 +312,7 @@ def get_path(basename: str, extension: str, specified_dir: str = ""):
             subdir = os.path.join(cache_dir(), specified_dir)
     else:
         subdir = os.path.join(cache_dir(), basename[1:3])
-    path = os.path.join(subdir, f"{basename}.{extension}")
+    path = os.path.join(subdir, f"{basename}.{extension}").replace(os.sep, "/")
     return basename, subdir, path
 
 
@@ -431,7 +431,10 @@ def cpp_compiler_search(search):
                 )
                 with lock:
                     cxx = install_gcc_via_conda()
-            subprocess.check_output([cxx, "--version"])
+            if cxx == "cl":
+                subprocess.check_output([cxx])
+            else:
+                subprocess.check_output([cxx, "--version"])
             return cxx
         except (subprocess.SubprocessError, FileNotFoundError, ImportError):
             continue
@@ -504,7 +507,12 @@ class VecISA:
 
 __attribute__((aligned(64))) float in_out_ptr0[16] = {0.0};
 
-extern "C" void __avx_chk_kernel() {
+#ifdef _MSC_VER
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+extern "C" DLLEXPORT void __avx_chk_kernel() {
     auto tmp0 = at::vec::Vectorized<float>(1);
     auto tmp1 = tmp0.exp();
     tmp1.store(in_out_ptr0);
@@ -543,7 +551,7 @@ cdll.LoadLibrary("__lib_path__")
         lock_dir = get_lock_dir()
         lock = FileLock(os.path.join(lock_dir, key + ".lock"), timeout=LOCK_TIMEOUT)
         with lock:
-            output_path = input_path[:-3] + "so"
+            output_path = input_path[:-3] + ("so" if sys.platform != "win32" else "dll")
             build_cmd = shlex.split(
                 cpp_compile_command(
                     input_path, output_path, warning_all=False, vec_isa=self
@@ -647,6 +655,10 @@ def pick_vec_isa():
 
 
 def get_shared(shared=True):
+    if sys.platform == "win32":
+        if cpp_compiler() in ["cl", "clang", "clang-cl"]:
+            return ""
+        return "-shared" if shared else ""
     return "-shared -fPIC" if shared else ""
 
 
@@ -655,6 +667,8 @@ def get_warning_all_flag(warning_all=True):
 
 
 def cpp_flags():
+    if cpp_compiler() in ["cl", "clang-cl"]:
+        return "/std:c++17"
     return "-std=c++17 -Wno-unused-variable"
 
 
@@ -664,6 +678,8 @@ def cpp_wrapper_flags():
 
 def optimization_flags():
     base_flags = "-O3 -ffast-math -fno-finite-math-only"
+    if cpp_compiler() in ["cl", "clang-cl"]:
+        base_flags = "/nologo /O2 /fp:fast"
     if config.is_fbcode():
         # FIXME: passing `-fopenmp` adds libgomp.so to the generated shared library's dependencies.
         # This causes `ldopen` to fail in fbcode, because libgomp does not exist in the default paths.
@@ -674,6 +690,8 @@ def optimization_flags():
         # Per https://mac.r-project.org/openmp/ right way to pass `openmp` flags to MacOS is via `-Xclang`
         # Also, `-march=native` is unrecognized option on M1
         base_flags += " -Xclang"
+    elif sys.platform == "win32":
+        pass
     else:
         if platform.machine() == "ppc64le":
             base_flags += " -mcpu=native"
@@ -682,12 +700,15 @@ def optimization_flags():
 
     # Internal cannot find libgomp.so
     if not config.is_fbcode():
-        base_flags += " -fopenmp"
+        if cpp_compiler() in ["cl", "clang-cl"]:
+            base_flags += " /openmp"
+        else:
+            base_flags += " -fopenmp"
     return base_flags
 
 
 def use_custom_generated_macros():
-    return "-D C10_USING_CUSTOM_GENERATED_MACROS"
+    return "-DC10_USING_CUSTOM_GENERATED_MACROS"
 
 
 def use_fb_internal_macros():
@@ -844,6 +865,9 @@ def get_include_and_linking_paths(
         else:
             libs = ["omp"] if config.is_fbcode() else ["gomp"]
 
+            if sys.platform == "win32" and "gomp" in libs:
+                libs.pop(libs.index("gomp"))
+
     # third party libs
     if config.is_fbcode():
         ipaths.append(build_paths.sleef())
@@ -859,9 +883,13 @@ def get_include_and_linking_paths(
         # (later on, we copy the include paths from cpp_extensions into our remote dir)
         ipaths.append("include")
 
-    ipaths = " ".join(["-I" + p for p in ipaths])
-    lpaths = " ".join(["-L" + p for p in lpaths])
-    libs = " ".join(["-l" + p for p in libs])
+    ipaths = " ".join([f'-I"{p}"' for p in ipaths])
+    lpaths = " ".join([f'-L"{p}"' for p in lpaths])
+    libs = " ".join([f'-l"{p}"' for p in libs])
+    if sys.platform == "win32":
+        ipaths = ipaths.replace(os.sep,  "/")
+        lpaths = lpaths.replace(os.sep,  "/")
+        libs = libs.replace(os.sep,  "/")
     return ipaths, lpaths, libs, macros
 
 
@@ -892,6 +920,10 @@ def cpp_compile_command(
         inp_name = input
         out_name = output
         linker_paths = ""  # let the compiler pick
+
+    out_dir = ""
+    if cpp_compiler() in ["cl", "clang-cl"]:
+        out_dir = "/Fe:" + os.path.dirname(out_name) + "/"
     return re.sub(
         r"[ \n]+",
         " ",
@@ -903,7 +935,8 @@ def cpp_compile_command(
             {use_custom_generated_macros()}
             {use_fb_internal_macros()}
             {use_standard_sys_dir_headers()}
-            -o {out_name}
+            {out_dir}
+            {"-o " if "cl" not in cpp_compiler() else "/LDd /OUT:"}"{out_name}"
         """,
     ).strip()
 
@@ -953,7 +986,7 @@ class AotCodeCache:
             lock_dir = get_lock_dir()
             lock = FileLock(os.path.join(lock_dir, key + ".lock"), timeout=LOCK_TIMEOUT)
             with lock:
-                output_so = os.path.splitext(input_path)[0] + ".so"
+                output_so = os.path.splitext(input_path)[0] + (".so" if sys.platform != "win32" else ".dll")
 
                 if not os.path.exists(output_so):
                     cmd = shlex.split(
@@ -1011,7 +1044,14 @@ def cpp_prefix():
         # everything that we compile into a folder for remote compilation.
         return f'#include "{os.path.basename(filename)}"'
     else:
+        filename = filename.replace(os.sep, "/")
         return f'#include "{filename}"'
+
+
+@functools.lru_cache(None)
+def output_encoding():
+    import locale
+    return locale.getpreferredencoding()
 
 
 # Given a path to an input cpp file and an output path,
@@ -1045,7 +1085,7 @@ def compile_file(input_path, output_path, cmd) -> None:
         else:
             subprocess.check_output(cmd, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as e:
-        output = e.output.decode("utf-8")
+        output = e.output.decode(output_encoding())
         openmp_problem = "'omp.h' file not found" in output or "libomp" in output
         if openmp_problem and sys.platform == "darwin":
             instruction = (
@@ -1095,7 +1135,7 @@ class CppCodeCache:
             lock_dir = get_lock_dir()
             lock = FileLock(os.path.join(lock_dir, key + ".lock"), timeout=LOCK_TIMEOUT)
             with lock:
-                output_path = input_path[:-3] + "so"
+                output_path = input_path[:-3] + ("so" if sys.platform != "win32" else "dll")
                 if not os.path.exists(output_path):
                     cmd = shlex.split(
                         cpp_compile_command(
@@ -1103,7 +1143,11 @@ class CppCodeCache:
                         )
                     )
                     compile_file(input_path, output_path, cmd)
-                cls.cache[key] = cls._load_library(output_path)
+                if sys.platform == "win32":
+                    #cls.cache[key] = cls._load_library(os.path.join(".", os.path.basename(output_path)))
+                    cls.cache[key] = cls._load_library(output_path)
+                else:
+                    cls.cache[key] = cls._load_library(output_path)
                 cls.cache[key].key = key
 
         return cls.cache[key]
@@ -1128,7 +1172,7 @@ class PyCodeCache:
         if key not in cls.cache:
             with open(path) as f:
                 try:
-                    code = compile(f.read(), path, "exec")
+                    code = compile(f.read(), path.replace(os.sep, "/"), "exec")
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to import {path}\n{type(e).__name__}: {e}"
@@ -1183,7 +1227,7 @@ class CppWrapperCodeCache:
         if not os.path.exists(cpp_wrapper_dir):
             os.makedirs(cpp_wrapper_dir)
 
-        ext = "so"
+        ext = "so" if sys.platform != "win32" else "dll"
         filepath = os.path.join(cpp_wrapper_dir, f"{name}.{ext}")
         log.debug("Cpp wrapper code path %s", filepath)
 
