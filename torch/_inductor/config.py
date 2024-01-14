@@ -426,6 +426,9 @@ class cpp:
         os.environ.get("CXX", "g++"),
         # "g++.par",
     )
+    if os.name == "nt":
+        cxx += ("cl",)
+
     # Allow kernel performance profiling via PyTorch profiler
     enable_kernel_profile = False
 
