@@ -384,7 +384,7 @@ def write_atomic(path: str, content: Union[str, bytes]) -> None:
     write_mode = "w" if isinstance(content, str) else "wb"
     with tmp_path.open(write_mode) as f:
         f.write(content)
-    tmp_path.rename(path)
+    tmp_path.replace(path)
 
 
 @dataclasses.dataclass
